@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>unfacet</Name>
+  <Repository>ghcr.io/au12/unfacet:latest</Repository>
+  <Registry>https://github.com/au12/unfacet/pkgs/container/unfacet</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/au12/unfacet/issues</Support>
+  <Project>https://github.com/au12/unfacet</Project>
+  <Overview>Unfacet turns STL, 3MF and OBJ meshes into editable STEP solids. It recognises planes, cylinders, cones, spheres, tori and ISO threads in the triangles and rebuilds them as true CAD geometry with OpenCascade. Web UI for fixing faces, resizing holes (M2–M16, clearance, tap drill, plastic or a real cut thread), checking deviation and STEP validity, filling cavities and closing mesh gaps. Sessions live in memory; no appdata is needed.</Overview>
+  <Category>Productivity: Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/au12/unfacet/main/unraid/unfacet.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/au12/unfacet/main/assets/icon.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="Web UI port" Target="8080" Default="8080" Mode="tcp" Description="Port for the web interface." Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+  <Config Name="Max upload (MB)" Target="MAX_UPLOAD_MB" Default="200" Mode="" Description="Largest mesh file accepted. Raise your reverse proxy's upload limit to match." Type="Variable" Display="always" Required="false" Mask="false">200</Config>
+  <Config Name="Parallel jobs" Target="WORKERS" Default="2" Mode="" Description="Analyses and exports that can run at the same time. Each uses one CPU core while working." Type="Variable" Display="always" Required="false" Mask="false">2</Config>
+  <Config Name="Session timeout (minutes)" Target="SESSION_TTL_MIN" Default="240" Mode="" Description="Idle sessions are dropped after this many minutes." Type="Variable" Display="advanced" Required="false" Mask="false">240</Config>
+  <Config Name="Max sessions" Target="MAX_SESSIONS" Default="30" Mode="" Description="The oldest session is dropped beyond this number." Type="Variable" Display="advanced" Required="false" Mask="false">30</Config>
+</Container>

@@ -1,7 +1,7 @@
 services:
   unfacet:
+    image: ghcr.io/au12/unfacet:latest
     build: .
-    image: unfacet:latest
     container_name: unfacet
     ports:
       - "8080:8080"

@@ -595,6 +595,7 @@ async function openFile(file) {
     S.sel = null; S.check = null; S.openTool = null; S.trace = null; endTrace();
     applyState(st, { keepSel: false });
     if (S.view === 'step' || S.view === 'validity') setView('faces');
+    setSheet('setup');
     toast(`Opened ${file.name}. Press Analyse mesh.`);
   });
 }
@@ -611,6 +612,7 @@ async function analyze() {
     const st = await api.job(job, progress);
     S.sel = null; S.check = null;
     applyState(st, { keepSel: false });
+    if (narrow()) setSheet('inspect');
     toast(`Found ${plural(st.summary.faces, 'face')} in ${fmt(st.elapsed, 1)} s.`);
   });
 }
@@ -653,8 +655,15 @@ async function report() {
 }
 
 // ------------------------------------------------------------------ selection & picking
+const narrow = () => matchMedia('(max-width: 900px)').matches;
+function setSheet(which) {
+  $('#app').dataset.sheet = which;
+  document.querySelectorAll('#sheetTabs button').forEach(b => b.setAttribute('aria-pressed', b.dataset.sheet === which));
+}
+
 function select(id) {
   if (S.sel !== id) { S.openTool = null; S.holePick = null; }
+  if (id != null && narrow()) setSheet('inspect');
   S.sel = id;
   renderInspector();
   paint();
@@ -801,6 +810,7 @@ function bind() {
   window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('#stage').classList.remove('dragging'); openFile(e.dataTransfer.files[0]); });
 
   $('#analyzeBtn').addEventListener('click', analyze);
+  $('#sheetTabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) setSheet(b.dataset.sheet); });
   $('#legend').addEventListener('mouseover', e => {
     const k = e.target.closest('[data-k]')?.dataset.k;
     if (!S.st?.analyzed) return;
