@@ -65,7 +65,15 @@ class Session:
         self.redo_stack: list[Snapshot] = []
         self.build_cache = None     # (version, BuildResult)
         self.version = 0
-        self.cavities = repair.find_cavities(self.topo)
+        self._scan_bodies(reset_selection=True)
+
+    def _scan_bodies(self, reset_selection=False):
+        """Find paper-thin bodies (left out by default) and cavities (inner shells of a parent)."""
+        self.slivers = repair.find_slivers(self.topo, self.tol)
+        self.cavities = repair.find_cavities(self.topo, skip=self.slivers)
+        if reset_selection:
+            keep = [b for b in range(self.topo.n_bodies) if b not in self.slivers]
+            self.body_selected = keep if self.slivers and keep else None
 
     # ------------------------------------------------------------ history
     def _snapshot(self, label):
@@ -80,7 +88,7 @@ class Session:
     def _restore(self, s: Snapshot):
         if s.topo is not self.topo:
             self.topo = s.topo
-            self.cavities = repair.find_cavities(self.topo)
+            self._scan_bodies()
         self.regions = [r.copy() for r in s.regions]
         self.next_id = s.next_id
         self.changed()
@@ -552,7 +560,7 @@ class Session:
             raise OpError("The mesh has no open edges.")
         self.checkpoint("Close mesh gaps")
         self.topo = Topo(m)
-        self.cavities = repair.find_cavities(self.topo)
+        self._scan_bodies()
         L = None
         for tris, model in hints:
             placed = False
@@ -588,9 +596,8 @@ class Session:
             r.tris = remap[r.tris]
             r.tris = r.tris[r.tris >= 0]
         self.regions = [r for r in self.regions if len(r.tris)]
-        self.cavities = repair.find_cavities(self.topo)
         self.body_names = {}
-        self.body_selected = None
+        self._scan_bodies(reset_selection=True)
         self.changed()
         return len(cav)
 
@@ -667,6 +674,7 @@ class Session:
                         "size": [float(x) for x in size],
                         "volume": abs(repair.component_volume(self.topo, tris)),
                         "selected": self.body_selected is None or b in self.body_selected,
+                        "sliver": self.slivers.get(b),
                         "cavities": [c for c, p in self.cavities.items() if p == b]})
         return out
 

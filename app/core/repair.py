@@ -134,11 +134,26 @@ def _winding(P, V, F):
     return out
 
 
-def find_cavities(topo: Topo):
+def find_slivers(topo: Topo, tol):
+    """Paper-thin closed bodies (leftover modifier boxes, zero-thickness plates): {body: thickness}."""
+    out = {}
+    for b in range(topo.n_bodies):
+        tris = np.flatnonzero(topo.body == b)
+        area = float(topo.TA[tris].sum())
+        if area <= 0:
+            continue
+        thick = 2 * abs(component_volume(topo, tris)) / area
+        if thick < max(tol, 0.01):
+            out[b] = thick
+    return out
+
+
+def find_cavities(topo: Topo, skip=()):
     """Return {component: parent_component} for components enclosed by another component."""
     n = topo.n_bodies
     if n < 2:
         return {}
+    skip = set(skip)
     comps = [np.flatnonzero(topo.body == b) for b in range(n)]
     bbox = []
     for tris in comps:
@@ -147,10 +162,12 @@ def find_cavities(topo: Topo):
     out = {}
     order = sorted(range(n), key=lambda b: -np.prod(bbox[b][1] - bbox[b][0]))
     for b in range(n):
+        if b in skip:
+            continue
         lo, hi = bbox[b]
         best = None
         for o in order:
-            if o == b:
+            if o == b or o in skip:
                 continue
             olo, ohi = bbox[o]
             if np.all(olo <= lo + 1e-9) and np.all(ohi >= hi - 1e-9):

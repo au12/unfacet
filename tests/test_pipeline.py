@@ -75,3 +75,33 @@ def test_hole_resize_keeps_solid():
     assert all(res.closed.values()) and not res.discarded
     s.undo()
     assert s.region(hole["id"]).model["radius"] == pytest.approx(2.75, abs=1e-3)
+
+
+def test_parallel_matches_serial():
+    """Multi-core recognition and per-body STEP building give the same result as one core."""
+    import numpy as np
+    import trimesh
+    from app.core import brep, segment
+    from app.core.mesh import Topo
+    path = os.path.join(TMP, "row.stl")
+    if not os.path.exists(path):
+        src = os.path.join(TMP, "knob_row.stl")
+        M.write(M.knob(), src)
+        k = trimesh.load(src)
+        trimesh.util.concatenate([k.copy().apply_translation([i * 40, 0, 0]) for i in range(3)]).export(path)
+    with open(path, "rb") as f:
+        mesh = load_mesh(f.read(), "row.stl")
+    topo = Topo(mesh)
+    a = segment.segment(topo, 0.02, parallel=False)
+    b = segment.segment(topo, 0.02, parallel=True)
+    assert sorted(r.kind for r in a) == sorted(r.kind for r in b)
+    s = Session(mesh, "row.stl")
+    s.analyze({})
+    L = s.labels()
+    models = {r.id: r.model for r in s.regions}
+    kinds = {r.id: r.kind for r in s.regions}
+    one = brep.build(s.topo.V, s.topo.F, L, models, kinds, s.topo.body, tol=s.tol, parallel=False)
+    many = brep.build(s.topo.V, s.topo.F, L, models, kinds, s.topo.body, tol=s.tol, parallel=True)
+    assert one.closed == many.closed and all(many.closed.values())
+    assert len(one.face_region) == len(many.face_region)
+    assert volume(many.shape) == pytest.approx(volume(one.shape), rel=1e-9)

@@ -335,21 +335,79 @@ def _segment_patch(ctx, patch):
     return out + curved
 
 
-def segment(topo: Topo, tol=0.02, min_area_pct=0.0, types=fit.ORDER, smooth_deg=40.0,
-            normal_deg=35.0, progress=None):
-    ctx = _Ctx(topo, tol, [t for t in types if t in fit.ORDER], np.radians(smooth_deg), np.radians(normal_deg),
-               threads="thread" in types)
-    patches = sorted(_smooth_patches(ctx), key=lambda p: -len(p))
-    regions, done, total = [], 0, len(topo.F)
+PAR_MIN_TRIS = 4000   # below this a single core is quicker than shipping work to the pool
+
+
+def _segment_patches(ctx, patches, progress=None, total=None):
+    out, done = [], 0
     for patch in patches:
         for gs, model in _segment_patch(ctx, patch):
             tris = ctx.tris_of(gs)
-            regions.append(Region(len(regions), tris, model, model["type"] if model else "freeform", len(gs)))
+            out.append((tris, model, len(gs)))
             done += len(tris)
-        if progress:
+        if progress and total:
             progress(done / total)
+    return out
+
+
+def _segment_chunk(V, F, tol, types, smooth_deg, normal_deg, threads):
+    """Worker entry point: recognise every tangent-continuous area of a sub-mesh."""
+    import trimesh
+    sub = Topo(trimesh.Trimesh(V, F, process=False))
+    ctx = _Ctx(sub, tol, types, np.radians(smooth_deg), np.radians(normal_deg), threads=threads)
+    patches = sorted(_smooth_patches(ctx), key=lambda p: -len(p))
+    return [(tris.astype(np.int64), model, n) for tris, model, n in _segment_patches(ctx, patches)]
+
+
+def _segment_parallel(topo, ctx, patches, tol, smooth_deg, normal_deg, progress):
+    """Split the areas over the worker pool; areas never cross a sharp edge, so they are independent."""
+    from concurrent.futures import as_completed
+    from . import pool
+    ex = pool.get()
+    if ex is None:
+        return None
+    chunks = [np.concatenate([ctx.tris_of(p) for p in grp])
+              for grp in pool.balance(patches, [len(ctx.tris_of(p)) for p in patches], pool.workers() * 3)]
+    if len(chunks) < 2:
+        return None
+    futs = {}
+    for tris in chunks:
+        F = topo.F[tris]
+        vids, inv = np.unique(F, return_inverse=True)
+        f = ex.submit(_segment_chunk, topo.V[vids], inv.reshape(-1, 3), tol, list(ctx.types), smooth_deg,
+                      normal_deg, ctx.threads)
+        futs[f] = tris
+    out, done = [], 0
+    try:
+        for f in as_completed(futs):
+            tris = futs[f]
+            for local, model, n in f.result():
+                out.append((tris[local], model, n))
+            done += len(tris)
+            if progress:
+                progress(done / len(topo.F))
+    except Exception:  # noqa: BLE001 - a dead worker: fall back to one core
+        pool.reset()
+        return None
+    return out
+
+
+def segment(topo: Topo, tol=0.02, min_area_pct=0.0, types=fit.ORDER, smooth_deg=40.0,
+            normal_deg=35.0, progress=None, parallel=True):
+    ctx = _Ctx(topo, tol, [t for t in types if t in fit.ORDER], np.radians(smooth_deg), np.radians(normal_deg),
+               threads="thread" in types)
+    patches = sorted(_smooth_patches(ctx), key=lambda p: -len(p))
+    found = None
+    if parallel and len(topo.F) >= PAR_MIN_TRIS and len(patches) > 1:
+        found = _segment_parallel(topo, ctx, patches, tol, smooth_deg, normal_deg, progress)
+    if found is None:
+        found = _segment_patches(ctx, patches, progress, len(topo.F))
+    regions = [Region(i, tris, model, model["type"] if model else "freeform", n)
+               for i, (tris, model, n) in enumerate(found)]
     regions = postprocess(topo, regions, tol, min_area_pct, ctx.smooth, ctx.max_angle, ctx.types)
+    regions = renumber(regions)   # postprocess creates regions with placeholder ids; the passes below need unique ones
     regions = merge_same(topo, regions, tol, ctx.max_angle)
+    regions = absorb_fragments(topo, regions, tol, ctx.max_angle)
     regions = detect_threads(topo, regions, tol, enabled=("thread" in types))
     return renumber(regions)
 
@@ -375,6 +433,43 @@ def same_surface(a, b, tol):
         return ang(a["axis"], b["axis"]) > 0.9999 and abs(a["major"] - b["major"]) < tol and \
             abs(a["minor"] - b["minor"]) < tol and np.linalg.norm(np.subtract(a["center"], b["center"])) < tol
     return False
+
+
+def absorb_fragments(topo, regions, tol, max_angle, passes=10):
+    """Small curved fragments left at the edge of a big surface (where growth gave up on a borderline
+    fit) are folded back in when the big surface, as is or refitted over both, still holds."""
+    for _ in range(passes):
+        n = len(regions)
+        regions = _absorb_once(topo, regions, tol, max_angle)
+        if len(regions) == n:
+            break
+    return regions
+
+
+def _absorb_once(topo, regions, tol, max_angle):
+    L = tri_labels(topo, regions)
+    adj = region_adjacency(topo, L)
+    byid = {r.id: r for r in regions}
+    gone = set()
+    for r in sorted(regions, key=lambda x: len(x.tris)):
+        if r.id in gone or r.model is None or r.kind not in fit.ORDER or len(r.tris) > 80:
+            continue
+        hosts = [byid[n] for n, (ang, cnt) in sorted(adj.get(r.id, {}).items(), key=lambda x: -x[1][1])
+                 if n in byid and n not in gone and byid[n].model is not None and byid[n].kind in fit.ORDER[1:]
+                 and len(byid[n].tris) >= 3 * len(r.tris)]
+        for host in hosts:
+            Vf, Cf, Nf = _region_data(topo, r.tris)
+            m = fit.as_np(host.model)
+            tris = np.r_[host.tris, r.tris]
+            if not fit.check(m, Vf, Cf, Nf, tol, max_angle):
+                V, C, N = _region_data(topo, tris)
+                m = fit.refine(m, V)
+                if not fit.check(m, V, C, N, tol, max_angle):
+                    continue
+            host.tris, host.model, host.groups = tris, fit.clean(m), host.groups + r.groups
+            gone.add(r.id)
+            break
+    return [r for r in regions if r.id not in gone]
 
 
 def merge_same(topo, regions, tol, max_angle):

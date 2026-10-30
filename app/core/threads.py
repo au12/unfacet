@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeWire
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepLib import BRepLib
@@ -100,7 +101,14 @@ def apply_threads(res, threads, tol):
             for extra in (0.0, 0.137, 0.311):   # nudge the run-out if the boolean trips on a coincidence
                 g = groove_solid(t["origin"], t["axis"], t["start"] - extra, t["end"] + extra,
                                  t["nominal"], t["pitch"], t["internal"])
-                cut = BRepAlgoAPI_Cut(bodies[bid], g)
+                cut = BRepAlgoAPI_Cut()
+                args, tools = TopTools_ListOfShape(), TopTools_ListOfShape()
+                args.Append(bodies[bid])
+                tools.Append(g)
+                cut.SetArguments(args)
+                cut.SetTools(tools)
+                cut.SetRunParallel(True)   # OpenCascade's multi-threaded boolean
+                cut.Build()
                 if cut.IsDone() and _volume(cut.Shape()) > 0.5 * _volume(bodies[bid]):
                     shp = cut.Shape()
                     break

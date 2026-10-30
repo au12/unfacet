@@ -23,6 +23,7 @@
   <Config Name="Web UI port" Target="8080" Default="8080" Mode="tcp" Description="Port for the web interface." Type="Port" Display="always" Required="true" Mask="false">8080</Config>
   <Config Name="Max upload (MB)" Target="MAX_UPLOAD_MB" Default="200" Mode="" Description="Largest mesh file accepted. Raise your reverse proxy's upload limit to match." Type="Variable" Display="always" Required="false" Mask="false">200</Config>
   <Config Name="Parallel jobs" Target="WORKERS" Default="2" Mode="" Description="Analyses and exports that can run at the same time. Each uses one CPU core while working." Type="Variable" Display="always" Required="false" Mask="false">2</Config>
+  <Config Name="CPU workers" Target="CPU_WORKERS" Default="0" Mode="" Description="Processes used for multi-core recognition and STEP building. 0 uses every core; 1 turns it off. Lower it to leave cores free for other containers." Type="Variable" Display="always" Required="false" Mask="false">0</Config>
   <Config Name="Session timeout (minutes)" Target="SESSION_TTL_MIN" Default="240" Mode="" Description="Idle sessions are dropped after this many minutes." Type="Variable" Display="advanced" Required="false" Mask="false">240</Config>
   <Config Name="Max sessions" Target="MAX_SESSIONS" Default="30" Mode="" Description="The oldest session is dropped beyond this number." Type="Variable" Display="advanced" Required="false" Mask="false">30</Config>
 </Container>

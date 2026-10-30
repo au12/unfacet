@@ -20,17 +20,20 @@ from OCP.Geom import (Geom_ConicalSurface, Geom_CylindricalSurface, Geom_Plane, 
 from OCP.GeomAPI import GeomAPI_PointsToBSpline
 from OCP.GeomAbs import GeomAbs_C2
 from OCP.GProp import GProp_GProps
+from OCP.ShapeBuild import ShapeBuild_ReShape
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shell, ShapeFix_Solid
 from OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
 from OCP.TopAbs import TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Face, TopoDS_Shell
+from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Face, TopoDS_Shell, TopoDS_Solid, TopoDS_Wire
 from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.gp import gp_Ax3, gp_Dir, gp_Pln, gp_Pnt
 
 from . import fit
 
 ANALYTIC = set(fit.ORDER) | {"thread"}
+# OpenCascade's own multi-threading (validity checks, meshing, booleans)
+PARALLEL = True
 
 
 def _p(x):
@@ -145,8 +148,21 @@ class BuildResult:
         self.messages = []
 
 
-def build(V, F, L, models, kinds, body, bodies=None, tol=0.02, progress=None, shell_of=None, slack=None):
-    """Build the B-rep. models/kinds indexed by region id. Returns BuildResult."""
+PAR_MIN_TRIS = 4000
+
+
+def build(V, F, L, models, kinds, body, bodies=None, tol=0.02, progress=None, shell_of=None, slack=None,
+          parallel=True):
+    """Build the B-rep. models/kinds indexed by region id. Returns BuildResult.
+    Separate bodies are built on separate cores when there are several and the mesh is big enough."""
+    if parallel and len(F) >= PAR_MIN_TRIS:
+        res = _build_parallel(V, F, L, models, kinds, body, bodies, tol, progress, shell_of, slack)
+        if res is not None:
+            return res
+    return _build_serial(V, F, L, models, kinds, body, bodies, tol, progress, shell_of, slack)
+
+
+def _build_serial(V, F, L, models, kinds, body, bodies=None, tol=0.02, progress=None, shell_of=None, slack=None):
     discarded = set()
     for attempt in range(4):
         res = _build_once(V, F, L, models, kinds, body, bodies, tol, discarded,
@@ -159,6 +175,86 @@ def build(V, F, L, models, kinds, body, bodies=None, tol=0.02, progress=None, sh
         if progress:
             progress(0.5 + 0.1 * attempt)
     res.discarded = set(discarded)
+    return res
+
+
+def _shape_bytes(shape):
+    import io
+    from OCP.BinTools import BinTools
+    bio = io.BytesIO()
+    BinTools.Write_s(shape, bio)
+    return bio.getvalue()
+
+
+def _shape_from_bytes(data):
+    import io
+    from OCP.BinTools import BinTools
+    from OCP.TopoDS import TopoDS_Shape
+    shape = TopoDS_Shape()
+    BinTools.Read_s(shape, io.BytesIO(data))
+    return shape
+
+
+def _faces(shape):
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        yield TopoDS.Face(ex.Current())
+        ex.Next()
+
+
+def _build_worker(V, F, L, models, kinds, body, subset, tol, shell_of, slack):
+    """Worker entry point: build some bodies and ship them back in OpenCascade's binary format."""
+    res = _build_serial(V, F, L, models, kinds, body, subset, tol, None, shell_of, slack)
+    reg = {_fkey(f): r for f, r in res.face_region}
+    out = []
+    for bid, shape in res.bodies:
+        out.append((bid, _shape_bytes(shape), [reg.get(_fkey(f), -1) for f in _faces(shape)]))
+    return {"bodies": out, "closed": res.closed, "invalid": res.invalid, "discarded": res.discarded,
+            "messages": res.messages}
+
+
+def _build_parallel(V, F, L, models, kinds, body, bodies, tol, progress, shell_of, slack):
+    from concurrent.futures import as_completed
+    from . import pool
+    ex = pool.get()
+    if ex is None:
+        return None
+    shell_of = body if shell_of is None else shell_of
+    sel = np.ones(len(F), bool) if bodies is None else np.isin(shell_of, list(bodies)) | np.isin(body, list(bodies))
+    ids, counts = np.unique(body[sel], return_counts=True)
+    if len(ids) < 2:
+        return None
+    groups = pool.balance([int(i) for i in ids], [float(c) for c in counts], pool.workers())
+    if len(groups) < 2:
+        return None
+    futs = [ex.submit(_build_worker, V, F, L, models, kinds, body, set(g), tol, shell_of, slack or {})
+            for g in groups]
+    res = BuildResult()
+    parts = []
+    try:
+        for i, f in enumerate(as_completed(futs)):
+            parts.append(f.result())
+            if progress:
+                progress(0.1 + 0.8 * (i + 1) / len(futs))
+    except Exception:  # noqa: BLE001 - a dead worker: build on one core instead
+        pool.reset()
+        return None
+    comp = TopoDS_Compound()
+    B = BRep_Builder()
+    B.MakeCompound(comp)
+    for part in sorted(parts, key=lambda p: min([b for b, _, _ in p["bodies"]] or [0])):
+        for bid, data, regs in part["bodies"]:
+            shape = _shape_from_bytes(data)
+            res.bodies.append((bid, shape))
+            res.face_region.extend((f, r) for f, r in zip(_faces(shape), regs) if r >= 0)
+            B.Add(comp, shape)
+        res.closed.update(part["closed"])
+        res.invalid |= set(part["invalid"])
+        res.discarded |= set(part["discarded"])
+        res.messages.extend(part["messages"])
+    res.bodies.sort(key=lambda b: b[0])
+    res.shape = comp
+    res._failed = set()
     return res
 
 
@@ -342,20 +438,24 @@ def _build_once(V, F, L, models, kinds, body, bodies, tol, discarded, shell_of, 
 
     seg_edge = {}
 
+    def root(v):
+        return find(v) if v in corners else v
+
     def segment_edge(a, b):
-        k = (min(a, b), max(a, b))
-        ra = find(a) if a in corners else a
-        rb = find(b) if b in corners else b
+        """Straight edge between two mesh vertices, shared by every face that uses it.
+        Keyed by the merged (root) vertices so collapsed corners never produce twin edges."""
+        ra, rb = root(a), root(b)
         if ra == rb:
             return "SKIP"
+        k = (min(ra, rb), max(ra, rb))
         if k not in seg_edge:
-            pa, pb = pos.get(k[0], V[k[0]]), pos.get(k[1], V[k[1]])
             mk = BRepBuilderAPI_MakeEdge(tv(k[0]), tv(k[1]))
-            if not mk.IsDone():
-                seg_edge[k] = None
-            else:
-                seg_edge[k] = mk.Edge()
+            seg_edge[k] = mk.Edge() if mk.IsDone() else None
         return seg_edge[k]
+
+    def edge_forward(a, b):
+        """Does the shared edge for (a, b) run from a to b?"""
+        return root(a) < root(b)
 
     tol_e = max(tol * 0.25, 1e-4)
     for ch in chains:
@@ -398,13 +498,17 @@ def _build_once(V, F, L, models, kinds, body, bodies, tol, discarded, shell_of, 
     region_tris = {}
     for t, l in enumerate(Ls):
         region_tris.setdefault(int(l), []).append(t)
+    # one shared record of every edge ShapeFix splits (seams of round faces), so the
+    # neighbouring faces can be given the same pieces and the shell closes without sewing
+    reshape = ShapeBuild_ReShape()
 
     for r, tris in region_tris.items():
         bid = int(body[tri_ids[tris[0]]])
         comp_id = int(shell_of[tri_ids[tris[0]]])
         if r in analytic:
             face = _analytic_face(r, analytic[r], loops.get(r, []), he, chains, edge_chain, segment_edge,
-                                  corners, V, Fs[tris], tol, check_area=kinds.get(r) != "thread")
+                                  corners, V, Fs[tris], tol, check_area=kinds.get(r) != "thread",
+                                  edge_forward=edge_forward, reshape=reshape)
             if face is None:
                 res._failed.add(r)
                 continue
@@ -415,16 +519,24 @@ def _build_once(V, F, L, models, kinds, body, bodies, tol, discarded, shell_of, 
                 es = [segment_edge(a, b), segment_edge(b, c), segment_edge(c, a)]
                 if any(e is None or isinstance(e, str) for e in es):
                     continue
-                w = BRepBuilderAPI_MakeWire()
-                for e in es:
-                    w.Add(e)
-                if not w.IsDone():
-                    continue
-                mf = BRepBuilderAPI_MakeFace(w.Wire(), True)
-                if mf.IsDone():
-                    faces_by_body.setdefault(bid, []).append((mf.Face(), r, comp_id))
+                wire = TopoDS_Wire()
+                B.MakeWire(wire)
+                for e, (u, v) in zip(es, ((a, b), (b, c), (c, a))):
+                    B.Add(wire, e if edge_forward(u, v) else e.Reversed())
+                wire.Closed(True)
+                f = _facet(wire, (pos.get(a, V[a]), pos.get(b, V[b]), pos.get(c, V[c])), tol)
+                if f is not None:
+                    faces_by_body.setdefault(bid, []).append((f, r, comp_id))
     if res._failed - discarded:
         return res
+    for bid, flist in faces_by_body.items():
+        out = []
+        for f, r, c in flist:
+            g = TopoDS.Face(reshape.Apply(f))
+            if not g.IsSame(f) or not g.IsEqual(f):
+                g = _settle_face(g, tol)
+            out.append((g, r, c))
+        faces_by_body[bid] = out
 
     # ---- shells & solids
     comp = TopoDS_Compound()
@@ -436,10 +548,31 @@ def _build_once(V, F, L, models, kinds, body, bodies, tol, discarded, shell_of, 
         res.face_region.extend(mapping)
         B.Add(comp, shape)
     res.shape = comp
-    for f, r in res.face_region:
-        if not BRepCheck_Analyzer(f).IsValid():
-            res.invalid.add(r)
+    an = BRepCheck_Analyzer(comp, True, PARALLEL)
+    if not an.IsValid():
+        for f, r in res.face_region:
+            if not an.IsValid(f):
+                res.invalid.add(r)
+        for bid, shp in res.bodies:
+            if res.closed.get(bid) and not an.IsValid(shp):
+                res.closed[bid] = False   # the solid as a whole does not check out
     return res
+
+
+def _facet(wire, P, tol):
+    """Flat triangle face on its own plane (much faster than letting OCC search for the plane)."""
+    p0, p1, p2 = (np.asarray(x, float) for x in P)
+    n = np.cross(p1 - p0, p2 - p0)
+    ln = np.linalg.norm(n)
+    if ln < 1e-14:
+        mf = BRepBuilderAPI_MakeFace(wire, True)
+        return mf.Face() if mf.IsDone() else None
+    n /= ln
+    face = TopoDS_Face()
+    B = BRep_Builder()
+    B.MakeFace(face, Geom_Plane(gp_Pln(_p(p0), _d(n))), tol * 0.1)
+    B.Add(face, wire)
+    return face
 
 
 def BRepLib_vertex(p, tol):
@@ -504,7 +637,8 @@ def _fail(r, why):
     return None
 
 
-def _analytic_face(r, m, loops, he, chains, edge_chain, segment_edge, corners, V, tris, tol, check_area=True):
+def _analytic_face(r, m, loops, he, chains, edge_chain, segment_edge, corners, V, tris, tol, check_area=True,
+                   edge_forward=None, reshape=None):
     region_pts = V[np.unique(tris)]
     try:
         surf = make_surface(m, region_pts)
@@ -549,7 +683,7 @@ def _analytic_face(r, m, loops, he, chains, edge_chain, segment_edge, corners, V
                     if e == "SKIP":
                         k += 1
                         continue
-                    edges.append(e if _starts_at(e, a2, b2) else e.Reversed())
+                    edges.append(e if edge_forward(a2, b2) else e.Reversed())
                     k += 1
             else:
                 e = ch.edges[0]
@@ -577,12 +711,16 @@ def _analytic_face(r, m, loops, he, chains, edge_chain, segment_edge, corners, V
         B.Add(face, w if agree else w.Reversed())
     try:
         sf = ShapeFix_Face(face)
+        if reshape is not None:
+            sf.SetContext(reshape)
         sf.SetPrecision(tol * 0.1)
         sf.SetMaxTolerance(max(tol * 5, 0.1))
         sf.Perform()
         face = sf.Face()
         if not BRepCheck_Analyzer(face).IsValid():
             sf2 = ShapeFix_Face(face)
+            if reshape is not None:
+                sf2.SetContext(reshape)
             sf2.SetPrecision(tol * 0.1)
             sf2.SetMaxTolerance(max(tol * 5, 0.1))
             sf2.FixMissingSeam()
@@ -604,6 +742,28 @@ def _analytic_face(r, m, loops, he, chains, edge_chain, segment_edge, corners, V
     if check_area and mesh_area > 0 and not (0.7 < abs(props.Mass()) / mesh_area < 1.3):
         return _fail(r, f"area {props.Mass():.2f} vs {mesh_area:.2f} wires {len(wires)}")
     return face
+
+
+def _settle_face(face, tol):
+    """A face that received split edges from a neighbour: put the pieces in order and give them
+    curves on this surface. Edges are fixed in place, so they stay shared with the neighbour."""
+    if BRepCheck_Analyzer(face).IsValid():
+        return face
+    from OCP.ShapeFix import ShapeFix_Wire
+    from OCP.TopAbs import TopAbs_WIRE
+    from OCP.BRepTools import BRepTools
+    B = BRep_Builder()
+    fixed = TopoDS.Face(face.EmptyCopied())
+    ex = TopExp_Explorer(face, TopAbs_WIRE)
+    while ex.More():
+        w = TopoDS.Wire(ex.Current())
+        sfw = ShapeFix_Wire(w, face, tol * 0.1)
+        sfw.FixReorder()
+        sfw.FixEdgeCurves()
+        B.Add(fixed, sfw.Wire())
+        ex.Next()
+    fixed.Orientation(face.Orientation())
+    return fixed
 
 
 def _band_face(m, surf, loops, he, V, agree, tol):
@@ -706,7 +866,25 @@ def _shell_from(faces, tol):
 
 
 def _try_solid(shells):
-    """Outer shell first, then inner (cavity) shells."""
+    """Outer shell first, then inner (cavity) shells. Fast path orients the solid directly; the
+    full topology check happens once, in parallel, for the whole result."""
+    try:
+        B = BRep_Builder()
+        sol = TopoDS_Solid()
+        B.MakeSolid(sol)
+        for sh in shells:
+            B.Add(sol, sh)
+        if BRepLib.OrientClosedSolid_s(sol):
+            props = GProp_GProps()
+            BRepGProp.VolumeProperties_s(sol, props)
+            if props.Mass() > 0:
+                return sol
+    except Exception:  # noqa: BLE001
+        pass
+    return _try_solid_fix(shells)
+
+
+def _try_solid_fix(shells):
     try:
         ms = BRepBuilderAPI_MakeSolid(TopoDS.Shell(shells[0]))
         for sh in shells[1:]:
@@ -750,14 +928,18 @@ def _free_wires(shape):
     return n
 
 
-def _comp_shell(faces, tol):
-    """One closed shell per mesh component; sew only if the shared-edge build left gaps."""
-    sh = _shell_from(faces, tol)
-    if _free_wires(sh) == 0:
-        return sh, None
-    sew = BRepBuilderAPI_Sewing(max(tol * 2, 1e-3))
+def _raw_shell(faces):
+    B = BRep_Builder()
+    shell = TopoDS_Shell()
+    B.MakeShell(shell)
     for f in faces:
-        sew.Add(f)
+        B.Add(shell, f)
+    return shell
+
+
+def _sew(shape, tol):
+    sew = BRepBuilderAPI_Sewing(max(tol * 2, 1e-3))
+    sew.Add(shape)
     sew.Perform()
     sewed = sew.SewedShape()
     best, nbest = None, -1
@@ -771,11 +953,44 @@ def _comp_shell(faces, tol):
         if cnt > nbest:
             best, nbest = ex.Current(), cnt
         ex.Next()
+    return (TopoDS.Shell(best) if best is not None else None), sew
+
+
+def _comp_shell(faces, tol):
+    """One closed shell per mesh component. Faces share their edges, so this is normally closed
+    as built; otherwise sew. Sewing the shell (not loose faces) only touches its few free edges."""
+    raw = _raw_shell(faces)
+    if _free_wires(raw) == 0:
+        raw.Closed(True)
+        return raw, None
+    sh, sew = _sew(raw, tol)
+    if sh is not None and _free_wires(sh) == 0:
+        sh.Closed(True)
+        return sh, sew
+    # last resort: orientation repair, then sew loose faces
+    fixed = _shell_from(faces, tol)
+    if _free_wires(fixed) == 0:
+        return fixed, None
+    sew2 = BRepBuilderAPI_Sewing(max(tol * 2, 1e-3))
+    for f in faces:
+        sew2.Add(f)
+    sew2.Perform()
+    best, nbest = None, -1
+    ex = TopExp_Explorer(sew2.SewedShape(), TopAbs_SHELL)
+    while ex.More():
+        cnt = 0
+        ef = TopExp_Explorer(ex.Current(), TopAbs_FACE)
+        while ef.More():
+            cnt += 1
+            ef.Next()
+        if cnt > nbest:
+            best, nbest = ex.Current(), cnt
+        ex.Next()
     if best is None:
-        return sh, None
+        return fixed, None
     fs = ShapeFix_Shell(TopoDS.Shell(best))
     fs.Perform()
-    return fs.Shell(), sew
+    return fs.Shell(), sew2
 
 
 def _close_body(flist, tol):
@@ -814,6 +1029,8 @@ def _close_body(flist, tol):
 
 def _modified(sew, f):
     try:
+        if sew.IsModifiedSubShape(f):
+            return TopoDS.Face(sew.ModifiedSubShape(f))
         if sew.IsModified(f):
             return TopoDS.Face(sew.Modified(f))
     except Exception:  # noqa: BLE001
@@ -879,7 +1096,7 @@ def tessellate(res, lin=None):
     BRepBndLib.Add_s(res.shape, b)
     p0, p1 = b.CornerMin(), b.CornerMax()
     diag = float(np.linalg.norm([p1.X() - p0.X(), p1.Y() - p0.Y(), p1.Z() - p0.Z()]))
-    BRepMesh_IncrementalMesh(res.shape, lin or max(diag * 4e-4, 1e-3), False, 0.25, True)
+    BRepMesh_IncrementalMesh(res.shape, lin or max(diag * 4e-4, 1e-3), False, 0.25, PARALLEL)
     Vs, Fs, Rs = [], [], []
     off = 0
     reg = {}

@@ -10,4 +10,5 @@ services:
       SESSION_TTL_MIN: "240"   # idle sessions are dropped after this many minutes
       MAX_SESSIONS: "30"       # oldest session is dropped beyond this
       WORKERS: "2"             # analyses / exports that can run at the same time
+      CPU_WORKERS: "0"         # processes for multi-core recognition and STEP building (0 = all cores, 1 = off)
     restart: unless-stopped

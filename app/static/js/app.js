@@ -224,7 +224,7 @@ function renderBodies() {
     <li data-body="${b.id}">
       <input type="checkbox" ${b.selected ? 'checked' : ''} aria-label="Include ${esc(b.name)}">
       <span class="bname" title="Double-click to rename">${esc(b.name)}</span>
-      <span class="bmeta">${b.size.map(x => fmt(x, 1)).join(' × ')} mm, ${b.triangles.toLocaleString()} triangles${b.cavities.length ? `, ${plural(b.cavities.length, 'cavity', 'cavities')}` : ''}</span>
+      <span class="bmeta">${b.sliver != null ? `Paper-thin (${fmt(b.sliver, 3)} mm), left out by default. ` : ''}${b.size.map(x => fmt(x, 1)).join(' × ')} mm, ${b.triangles.toLocaleString()} triangles${b.cavities.length ? `, ${plural(b.cavities.length, 'cavity', 'cavities')}` : ''}</span>
     </li>`).join('');
 }
 

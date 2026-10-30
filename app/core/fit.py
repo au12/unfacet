@@ -12,6 +12,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.optimize import minimize_scalar
 
+from . import jit
+
 ANALYTIC = ("plane", "cylinder", "cone", "sphere", "torus")
 ORDER = ANALYTIC  # simplest first
 
@@ -59,6 +61,27 @@ def _lm(f, x0, iters=25):
         if not step_ok or done:
             break
     return _Sol(x)
+
+
+def _np_residuals(code, x, P):
+    if code == jit.SPHERE:
+        return np.linalg.norm(P - x[:3], axis=1) - x[3]
+    ax = _unit(x[3:6]); v = P - x[:3]
+    h = v @ ax
+    rho = np.linalg.norm(v - np.outer(h, ax), axis=1)
+    if code == jit.CYLINDER:
+        return rho - x[6]
+    if code == jit.CONE:
+        return rho * np.cos(x[6]) - h * np.sin(x[6])
+    return np.sqrt((rho - x[6]) ** 2 + h ** 2) - x[7]
+
+
+def _fit_lm(code, x0, P, iters=25):
+    """Least-squares fit of model `code` to points P, compiled when Numba is available."""
+    x0 = np.ascontiguousarray(x0, dtype=np.float64)
+    if jit.AVAILABLE:
+        return _Sol(jit.lm(code, x0, np.ascontiguousarray(P, dtype=np.float64), iters))
+    return _lm(lambda x: _np_residuals(code, x, P), x0, iters)
 
 
 def _unit(v):
@@ -177,7 +200,7 @@ def fit_sphere(P):
     m = {"type": "sphere", "center": c, "radius": r}
     if len(P) < 8:
         return m
-    res = _lm(lambda x: np.linalg.norm(P - x[:3], axis=1) - x[3], np.r_[c, r])
+    res = _fit_lm(jit.SPHERE, np.r_[c, r], P)
     m["center"], m["radius"] = res.x[:3], abs(res.x[3])
     return m
 
@@ -204,7 +227,7 @@ def fit_cylinder(P, N, Pv=None):
         return np.linalg.norm(v - np.outer(v @ ax, ax), axis=1) - x[6]
     if len(P) < 12:
         return {"type": "cylinder", "origin": o, "axis": a, "radius": r}
-    sol = _lm(res, np.r_[o, a, r])
+    sol = _fit_lm(jit.CYLINDER, np.r_[o, a, r], P)
     ax = _unit(sol.x[3:6])
     o = sol.x[:3]
     o = o + ax * ((P - o) @ ax).mean()
@@ -237,7 +260,7 @@ def fit_cone(P, N):
         if not (np.radians(0.5) < al < np.radians(89.5)):
             return None
         return {"type": "cone", "apex": apex, "axis": a, "angle": float(al)}
-    sol = _lm(res, np.r_[apex, a, al])
+    sol = _fit_lm(jit.CONE, np.r_[apex, a, al], P)
     ax = _unit(sol.x[3:6]); al = sol.x[6]
     apex = sol.x[:3]
     if ((P - apex) @ ax).mean() < 0:
@@ -251,8 +274,15 @@ def fit_cone(P, N):
 
 
 def fit_torus(P, N, scale):
+    """`scale` is the size of the region being fitted."""
     """Spine method: p - r*n lies on a circle for the right minor radius r."""
+    Pc = np.ascontiguousarray(P, dtype=np.float64)
+    Nc = np.ascontiguousarray(N, dtype=np.float64)
+
     def score(r):
+        if jit.AVAILABLE:
+            sc, c, a, R = jit.torus_spine_score(Pc, Nc, float(r))
+            return sc, (c, a, R)
         S = P - r * N
         c = S.mean(0)
         D = S - c
@@ -265,7 +295,7 @@ def fit_torus(P, N, scale):
 
     best = None
     for sgn in (1, -1):
-        for r in np.geomspace(scale * 1e-3, scale, 14):
+        for r in np.geomspace(scale * 1e-3, scale * 2, 14):
             s, _ = score(sgn * r)
             if best is None or s < best[0]:
                 best = (s, sgn * r)
@@ -286,7 +316,7 @@ def fit_torus(P, N, scale):
         if R <= minor * 1.0001:
             return None
         return {"type": "torus", "center": c, "axis": a, "major": R, "minor": minor}
-    sol = _lm(res, np.r_[c, a, R, minor])
+    sol = _fit_lm(jit.TORUS, np.r_[c, a, R, minor], P)
     R, minor = abs(sol.x[6]), abs(sol.x[7])
     if R <= minor * 1.0001 or R < scale * 1e-4:
         return None
@@ -320,23 +350,33 @@ def check(m, V, C, N, tol, max_angle):
         d = np.abs((normal_at(m, C) * N).sum(1))
         if d.min() < np.cos(max_angle):
             return False
+        # Triangle interiors must stay near the surface too. A curved model can pass through every
+        # vertex of a few long, flat facets (a 3 mm wall strip "fits" an R1200 cylinder); real CAD
+        # tessellations keep their chord sag far below this.
+        if m["type"] != "plane" and np.abs(distance(m, C)).max() > centroid_cap(tol):
+            return False
     return True
 
 
-def sanity(m, scale):
-    """Reject numerically silly models (huge radii that just mimic planes)."""
+def centroid_cap(tol):
+    return max(10 * tol, 0.3)
+
+
+def sanity(m, ext, centre=None):
+    """Reject numerically silly models, judged against the size of the region being fitted (so the
+    answer never depends on how big the rest of the mesh is)."""
     if m is None:
         return False
-    big = scale * 50
+    ext = max(float(ext), 1e-9)
     t = m["type"]
-    if t == "cylinder":
-        return m["radius"] < big
-    if t == "sphere":
-        return m["radius"] < big
+    if t in ("cylinder", "sphere"):
+        return m["radius"] < ext * 50          # gentle arcs are fine; a "cylinder" that is a plane is not
     if t == "torus":
-        return m["major"] < big
+        # a fillet ring or a doughnut, not a huge horn torus impersonating a cylinder or a plane
+        return m["major"] < ext * 5 and m["minor"] < ext * 5 and m["major"] > m["minor"] * 1.0001
     if t == "cone":
-        return np.linalg.norm(m["apex"]) < big * 4
+        c = np.zeros(3) if centre is None else centre
+        return np.linalg.norm(np.asarray(m["apex"]) - c) < ext * 200
     return True
 
 
@@ -344,6 +384,8 @@ def best_fit(V, C, N, tol, max_angle, scale, types=ORDER, sample=800):
     """Fit the simplest primitive (in `types` order) that explains the data."""
     if len(V) < 3:
         return None
+    ext = float(np.ptp(V, axis=0).max())     # this region's size; `scale` is kept for API compatibility
+    centre = V.mean(0)
     rng = np.random.default_rng(0)
     Vs = V if len(V) <= sample else V[rng.choice(len(V), sample, replace=False)]
     Cs, Ns = (C, N) if len(C) <= sample else (lambda i: (C[i], N[i]))(rng.choice(len(C), sample, replace=False))
@@ -363,13 +405,13 @@ def best_fit(V, C, N, tol, max_angle, scale, types=ORDER, sample=800):
         elif t in ("cone", "torus"):
             if len(Cs) < 3:
                 continue
-            m0 = fit_type(t, Cs, Ns, scale)
+            m0 = fit_type(t, Cs, Ns, ext)
             if m0 is None:
                 continue
             m = refine(m0, Vs)
         else:
-            m = fit_type(t, Vs, Ns, scale)
-        if sanity(m, scale) and check(m, V, C, N, tol, max_angle):
+            m = fit_type(t, Vs, Ns, ext)
+        if sanity(m, ext, centre) and check(m, V, C, N, tol, max_angle):
             return clean(m)
     return None
 
@@ -385,7 +427,7 @@ def refine(m, P):
             def res(x):
                 ax = _unit(x[3:6]); v = P - x[:3]
                 return np.linalg.norm(v - np.outer(v @ ax, ax), axis=1) - x[6]
-            s = _lm(res, np.r_[m["origin"], m["axis"], m["radius"]])
+            s = _fit_lm(jit.CYLINDER, np.r_[m["origin"], m["axis"], m["radius"]], P)
             ax = _unit(s.x[3:6]); o = s.x[:3]
             return {"type": t, "origin": o + ax * ((P - o) @ ax).mean(), "axis": ax, "radius": abs(s.x[6])}
         if t == "cone":
@@ -394,7 +436,7 @@ def refine(m, P):
                 hh = v @ ax
                 rr = np.linalg.norm(v - np.outer(hh, ax), axis=1)
                 return rr * np.cos(x[6]) - hh * np.sin(x[6])
-            s = _lm(res, np.r_[m["apex"], m["axis"], m["angle"]])
+            s = _fit_lm(jit.CONE, np.r_[m["apex"], m["axis"], m["angle"]], P)
             al = s.x[6]
             if not (np.radians(0.5) < al < np.radians(89.5)):
                 return m
@@ -405,7 +447,7 @@ def refine(m, P):
                 h = v @ ax
                 rho = np.linalg.norm(v - np.outer(h, ax), axis=1)
                 return np.sqrt((rho - x[6]) ** 2 + h ** 2) - x[7]
-            s = _lm(res, np.r_[m["center"], m["axis"], m["major"], m["minor"]])
+            s = _fit_lm(jit.TORUS, np.r_[m["center"], m["axis"], m["major"], m["minor"]], P)
             if abs(s.x[6]) <= abs(s.x[7]):
                 return m
             return {"type": t, "center": s.x[:3], "axis": _unit(s.x[3:6]), "major": abs(s.x[6]), "minor": abs(s.x[7])}

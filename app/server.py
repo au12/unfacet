@@ -24,7 +24,7 @@ MAX_UPLOAD_MB = float(os.environ.get("MAX_UPLOAD_MB", "200"))
 SESSION_TTL_MIN = float(os.environ.get("SESSION_TTL_MIN", "240"))
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "30"))
 WORKERS = int(os.environ.get("WORKERS", "2"))
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 app = FastAPI(title="Unfacet", version=VERSION, docs_url="/api/docs", openapi_url="/api/openapi.json")
 SESSIONS: dict[str, Session] = {}
@@ -58,6 +58,19 @@ def _reap():
 
 
 threading.Thread(target=_reap, daemon=True).start()
+
+
+def _warm():
+    """Compile the fitting kernels and start the worker pool in the background at boot."""
+    from .core import jit, pool
+    try:
+        jit.warmup()
+        pool.warm()
+    except Exception:  # noqa: BLE001 - never block start-up on this
+        traceback.print_exc()
+
+
+threading.Thread(target=_warm, daemon=True).start()
 
 
 def mesh_payload(s: Session):
@@ -184,7 +197,9 @@ class ExportIn(BaseModel):
 # ------------------------------------------------------------------ routes
 @app.get("/api/health")
 def health():
-    return {"ok": True, "version": VERSION, "sessions": len(SESSIONS)}
+    from .core import jit, pool
+    return {"ok": True, "version": VERSION, "sessions": len(SESSIONS), "cpu_workers": pool.workers(),
+            "compiled": jit.AVAILABLE}
 
 
 @app.get("/api/meta")

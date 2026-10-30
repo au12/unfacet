@@ -67,9 +67,34 @@ Or with compose (`docker compose up -d`), or build it yourself with `docker comp
 | `SESSION_TTL_MIN` | `240` | Idle sessions are dropped after this many minutes |
 | `MAX_SESSIONS` | `30` | Oldest session is dropped beyond this |
 | `WORKERS` | `2` | Analyses / exports that can run at the same time |
+| `CPU_WORKERS` | `0` | Processes for multi-core recognition and STEP building (`0` = every core, `1` = off) |
 
 Sessions live in memory, so the container is stateless: restart it and open files again.
-Run a single uvicorn process (the default); scale up with `WORKERS`, not extra processes.
+Run a single uvicorn process (the default); heavy work already fans out to `CPU_WORKERS` processes.
+
+### Performance
+
+Unfacet is CPU-bound by design. There is no GPU path, because none of the work suits one: the 3D view
+is drawn by your browser's GPU, recognition is thousands of small surface fits, and OpenCascade
+has no GPU support. Instead:
+
+- The surface-fitting solver is compiled to machine code with Numba (compiled into the image).
+- Recognition splits the mesh at sharp edges and recognises the areas on every core.
+- The STEP is built one body per core; faces share their edges, so solids close without sewing.
+- OpenCascade's own multi-threading is on for validity checks, meshing and thread cutting.
+- STEP files leave out the optional 2D edge curves, which CAD programs rebuild on import.
+
+Measured on a real 9,900-triangle, 10-body part (a bar with three sculpted noses) on a 2-core box,
+inside the container:
+
+| Step | Before | Now |
+|---|---|---|
+| Analyse | 4.4 s | 1.0 s |
+| Build the STEP | 12.4 s | about 2 s |
+| Write the STEP | 2.6 s, 17 MB | 1.4 s, 7 MB |
+| Cut a real M6 thread | 4.6 s | 0.7 s |
+
+More cores help further on parts with several bodies or many separate features.
 
 ## What it does
 
