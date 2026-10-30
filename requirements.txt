@@ -1,0 +1,9 @@
+cadquery-ocp==8.0.1.1
+numpy>=2.0
+scipy>=1.13
+trimesh>=4.4
+lxml>=5.0
+networkx>=3.0
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9

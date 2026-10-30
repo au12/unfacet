@@ -1,0 +1,13 @@
+services:
+  unfacet:
+    build: .
+    image: unfacet:latest
+    container_name: unfacet
+    ports:
+      - "8080:8080"
+    environment:
+      MAX_UPLOAD_MB: "200"     # largest mesh file accepted
+      SESSION_TTL_MIN: "240"   # idle sessions are dropped after this many minutes
+      MAX_SESSIONS: "30"       # oldest session is dropped beyond this
+      WORKERS: "2"             # analyses / exports that can run at the same time
+    restart: unless-stopped

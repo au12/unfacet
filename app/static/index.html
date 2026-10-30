@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Unfacet</title>
+  <meta name="description" content="Turn STL, 3MF and OBJ meshes into editable STEP solids with real planes, cylinders, cones, spheres, tori and threads.">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="importmap">
+    { "imports": { "three": "/vendor/three.module.js",
+                   "three/addons/OrbitControls.js": "/vendor/OrbitControls.js",
+                   "three-mesh-bvh": "/vendor/three-mesh-bvh.js" } }
+  </script>
+</head>
+<body>
+<div class="app" id="app" data-view="faces">
+  <header class="bar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M5 21 L13 6 L21 13 Z" class="logo-facet"/>
+        <path d="M13 6 L27 9 L21 13 Z" class="logo-facet b"/>
+        <path d="M5 21 L21 13 L24 26 Z" class="logo-facet c"/>
+        <circle cx="22" cy="21" r="6.5" class="logo-solid"/>
+      </svg>
+      <span class="brand-name">Unfacet</span>
+    </div>
+    <div class="file-meta" id="fileMeta" hidden>
+      <span class="file-name" id="fileName"></span>
+      <span class="file-sub" id="fileSub"></span>
+    </div>
+    <nav class="views" id="views" role="tablist" aria-label="View">
+      <button role="tab" data-view="faces" aria-selected="true" title="Faces (Q)">Faces</button>
+      <button role="tab" data-view="deviation" title="Deviation (W)">Deviation</button>
+      <button role="tab" data-view="validity" title="STEP validity (E)">Validity</button>
+      <button role="tab" data-view="cavities" title="Cavities (R)">Cavities</button>
+      <button role="tab" data-view="step" title="Result preview (T)">Result</button>
+    </nav>
+    <div class="bar-tools">
+      <button class="icon-btn" id="undoBtn" title="Undo (Ctrl+Z)" disabled aria-label="Undo">
+        <svg viewBox="0 0 20 20"><path d="M7 5 3 9l4 4M3.5 9H12a5 5 0 0 1 0 10h-2"/></svg></button>
+      <button class="icon-btn" id="redoBtn" title="Redo (Ctrl+Shift+Z)" disabled aria-label="Redo">
+        <svg viewBox="0 0 20 20"><path d="m13 5 4 4-4 4M16.5 9H8a5 5 0 0 0 0 10h2"/></svg></button>
+      <span class="sep"></span>
+      <button class="icon-btn" id="sectionBtn" title="Section view (S)" aria-label="Section view" aria-pressed="false">
+        <svg viewBox="0 0 20 20"><path d="M3 15 10 3l7 12Z"/><path d="M1 11h18" class="cut"/></svg></button>
+      <button class="icon-btn" id="edgesBtn" title="Show mesh triangles (M)" aria-label="Show triangles" aria-pressed="false">
+        <svg viewBox="0 0 20 20"><path d="M3 16 10 3l7 13Zm3.5-6.5h7M10 3v13"/></svg></button>
+      <button class="icon-btn" id="themeBtn" title="Light / dark" aria-label="Toggle theme">
+        <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="6"/><path d="M10 4a6 6 0 0 1 0 12Z" class="fill"/></svg></button>
+      <button class="icon-btn" id="helpBtn" title="Shortcuts (?)" aria-label="Keyboard shortcuts">
+        <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5"/><path d="M7.8 7.6a2.3 2.3 0 1 1 3 2.2c-.6.3-.8.7-.8 1.3v.6M10 14.4v.1"/></svg></button>
+      <div class="export-wrap">
+        <button class="btn primary" id="exportBtn" disabled>Download STEP</button>
+        <button class="btn primary caret" id="exportMore" disabled aria-label="Export options" aria-haspopup="true">
+          <svg viewBox="0 0 12 12"><path d="m3 4.5 3 3 3-3"/></svg></button>
+        <div class="popover" id="exportPop" hidden>
+          <h4>Threads in the STEP</h4>
+          <label class="radio"><input type="radio" name="tmode" value="cylinder" checked><span><b>Plain cylinder</b><small>Recognised threads become their crest cylinder. Small file, easy to edit.</small></span></label>
+          <label class="radio"><input type="radio" name="tmode" value="helical"><span><b>Real helical thread</b><small>Cut ISO flanks into recognised threads. Holes you set to a thread are always cut.</small></span></label>
+          <hr>
+          <a class="link" id="stlLink" href="#" download>Download repaired mesh (STL)</a>
+        </div>
+      </div>
+    </div>
+    <div class="progress" id="progress" hidden><span></span></div>
+  </header>
+
+  <aside class="rail left" id="leftRail">
+    <section class="block" id="fileBlock">
+      <div class="drop" id="drop" tabindex="0" role="button" aria-label="Open a mesh file">
+        <svg viewBox="0 0 40 40" aria-hidden="true"><path d="M8 28 18 9l14 9-10 13Z"/><path d="M18 9l4 22M8 28l24-10" class="thin"/></svg>
+        <div><b>Open a mesh</b><span>STL, 3MF or OBJ. Drop it anywhere.</span></div>
+        <input type="file" id="fileInput" accept=".stl,.3mf,.obj,.ply,.off" hidden>
+      </div>
+      <div class="notice warn" id="gapNotice" hidden>
+        <p><b id="gapCount"></b> The mesh is open, so the result cannot close into a solid.</p>
+        <button class="btn small" id="closeGapsBtn">Close mesh gaps</button>
+      </div>
+      <div class="notice" id="cavNotice" hidden>
+        <p id="cavText"></p>
+        <div class="row"><button class="btn small" id="cavViewBtn">Show cavities</button><button class="btn small" id="cavFillBtn" title="Fill every cavity so each body becomes one solid">Fill cavities</button></div>
+      </div>
+    </section>
+
+    <section class="block" id="bodiesBlock" hidden>
+      <h3>Bodies <span class="count" id="bodyCount"></span></h3>
+      <p class="hint">Untick bodies to leave them out of the analysis and the STEP. Double-click a name to rename it; the name goes into the STEP.</p>
+      <ul class="bodies" id="bodyList"></ul>
+    </section>
+
+    <section class="block" id="recBlock">
+      <h3>Recognition</h3>
+      <div class="fields">
+        <label class="field"><span>Tolerance</span><span class="input-unit"><input type="number" id="tolInput" value="0.02" min="0.001" max="2" step="0.005"><i>mm</i></span></label>
+        <label class="field"><span>Normal angle</span><span class="input-unit"><input type="number" id="angInput" value="35" min="5" max="60" step="1"><i>°</i></span></label>
+        <label class="field" title="Faces smaller than this share of the total area become freeform"><span>Smallest face</span><span class="input-unit"><input type="number" id="minInput" value="0" min="0" max="5" step="0.01"><i>%</i></span></label>
+      </div>
+      <div class="legend" id="legend"></div>
+      <button class="btn primary wide" id="analyzeBtn" disabled>Analyse mesh</button>
+      <div class="composition" id="composition" hidden aria-label="Share of surface area by face kind"></div>
+    </section>
+  </aside>
+
+  <main class="stage" id="stage">
+    <canvas id="viewport" aria-label="3D view"></canvas>
+    <div class="empty" id="empty">
+      <div class="empty-art" aria-hidden="true">
+        <svg viewBox="0 0 220 140">
+          <g class="mesh-side">
+            <path d="M20 110 60 30l40 25 10 55Z"/><path d="M60 30 75 70l25-15M20 110l55-40 35 40M75 70l35 40"/>
+          </g>
+          <path d="M126 70h22m-6-6 6 6-6 6" class="arrow"/>
+          <g class="solid-side">
+            <path d="M160 110V50l30-18 22 14v64Z"/><path d="M160 50l22 14 30-18M182 64v46"/>
+            <ellipse cx="197" cy="82" rx="7" ry="10"/>
+          </g>
+        </svg>
+      </div>
+      <h1>From triangles to a real solid</h1>
+      <p>Unfacet finds the planes, bores, fillets, chamfers and threads hiding in a mesh and rebuilds them as true CAD geometry. Change hole sizes, fix stray faces, then download a STEP for Fusion, SolidWorks, Onshape or FreeCAD.</p>
+      <button class="btn primary" id="emptyOpen">Open a mesh</button>
+      <p class="fine">Works best on meshes exported from CAD: Printables, Thingiverse and MakerWorld parts. Scans and sculpts mostly come out as freeform.</p>
+    </div>
+    <div class="section-ctl" id="sectionCtl" hidden>
+      <div class="seg small" id="sectionAxis"><button data-axis="x">X</button><button data-axis="y">Y</button><button data-axis="z" aria-pressed="true">Z</button></div>
+      <input type="range" id="sectionPos" min="0" max="1000" value="500" aria-label="Section position">
+      <button class="icon-btn small" id="sectionFlip" title="Flip side" aria-label="Flip section"><svg viewBox="0 0 20 20"><path d="M4 7h12l-3-3M16 13H4l3 3"/></svg></button>
+    </div>
+    <div class="viewcube" id="viewcube" aria-label="Standard views">
+      <button data-v="1" title="Front (1)">Front</button>
+      <button data-v="2" title="Top (2)">Top</button>
+      <button data-v="3" title="Right (3)">Right</button>
+      <button data-v="4" title="Iso (4)">Iso</button>
+      <button data-v="f" title="Fit (F)">Fit</button>
+    </div>
+    <div class="tracebar" id="tracebar" hidden>
+      <span id="traceText">Click points on the face. The path follows mesh edges between them.</span>
+      <button class="btn small" id="traceUndo">Remove last</button>
+      <button class="btn small" id="traceCancel">Cancel</button>
+      <button class="btn small primary" id="traceApply" disabled>Cut along the edges</button>
+    </div>
+    <div class="hover-tip" id="hoverTip" hidden></div>
+    <div class="dev-scale" id="devScale" hidden>
+      <span class="ramp"></span>
+      <span class="ticks"><i>0</i><i id="devTolMid"></i><i id="devTolMax"></i></span>
+    </div>
+  </main>
+
+  <aside class="rail right" id="inspector">
+    <div id="inspectorBody"></div>
+  </aside>
+
+  <footer class="status" id="status">
+    <span id="statusHint">Drag to rotate, scroll to zoom, Shift+drag to pan. F fits the view, 1–4 switch views.</span>
+  </footer>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</div>
+
+<dialog id="helpDlg" class="dialog">
+  <h2>Keyboard shortcuts</h2>
+  <dl class="keys">
+    <dt>F</dt><dd>Fit the model in view</dd>
+    <dt>1 2 3 4</dt><dd>Front, top, right and iso view</dd>
+    <dt>Q W E R T</dt><dd>Faces, deviation, validity, cavities, result</dd>
+    <dt>S</dt><dd>Section view</dd>
+    <dt>M</dt><dd>Show mesh triangles</dd>
+    <dt>Esc</dt><dd>Clear the selection, leave a tool</dd>
+    <dt>Ctrl Z</dt><dd>Undo</dd>
+    <dt>Ctrl Shift Z</dt><dd>Redo</dd>
+    <dt>Shift + drag</dt><dd>Pan</dd>
+  </dl>
+  <form method="dialog"><button class="btn">Close</button></form>
+</dialog>
+
+<dialog id="renameDlg" class="dialog small">
+  <form method="dialog" id="renameForm">
+    <h2 id="renameTitle">Rename body</h2>
+    <input type="text" id="renameInput" maxlength="120" autocomplete="off">
+    <div class="dlg-actions"><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="ok">Rename</button></div>
+  </form>
+</dialog>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>
