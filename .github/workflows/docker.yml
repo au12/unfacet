@@ -7,6 +7,13 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version to tag the image with (set by the Release workflow)
+        type: string
+        required: false
+        default: ""
 
 env:
   REGISTRY: ghcr.io
@@ -53,7 +60,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ (inputs.version || '') == '' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+            type=raw,value=${{ inputs.version }},enable=${{ (inputs.version || '') != '' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
