@@ -1,0 +1,92 @@
+name: Release
+
+# Bump the version in VERSION on main and this workflow tags that commit as v<version>,
+# publishes the GitHub release and builds the versioned image. Nothing happens if the release
+# already exists. Release notes come from the "## <version>" section of CHANGELOG.md, or the
+# "### <version>" entry of the Unraid template's <Changes>, or else GitHub's generated notes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "VERSION"
+      - "CHANGELOG.md"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.publish.outputs.created }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          version="$(cat VERSION)"
+          version="$(echo "$version" | tr -d '[:space:]')"
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::The version must look like 1.2.3 (got '$version')"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release if it doesn't exist
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $tag already exists, nothing to do."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          : > notes.md
+          if [ -f CHANGELOG.md ]; then
+            awk -v v="$VERSION" '
+              /^## / { if (found) exit; h = $2; gsub(/[\[\]v]/, "", h); if (h == v) { found = 1; next } }
+              found
+            ' CHANGELOG.md > notes.md
+          fi
+          if [ ! -s notes.md ]; then
+            for xml in unraid/*.xml templates/*.xml; do
+              [ -f "$xml" ] || continue
+              awk -v v="### $VERSION" '
+                index($0, v) == 1 { on = 1; next }
+                on && (/^### / || /<\/Changes>/) { exit }
+                on { print }
+              ' "$xml" | sed '/^[[:space:]]*$/d' > notes.md
+              [ -s notes.md ] && break
+            done
+          fi
+          if [ -s notes.md ]; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes-file notes.md
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --generate-notes
+          fi
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "Published $tag at $GITHUB_SHA"
+
+  # Tags created with the workflow token don't trigger other workflows, so build the
+  # versioned image here.
+  image:
+    needs: release
+    if: needs.release.outputs.created == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
